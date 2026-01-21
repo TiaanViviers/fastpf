@@ -51,5 +51,11 @@ Module.symvers
 Mkfile.old
 dkms.conf
 
+build/
+bin/
+benchmark_results/
+profile_results/
+*.csv
+
 # debug information files
 *.dwo
