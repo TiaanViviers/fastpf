@@ -55,7 +55,7 @@ static void ziggurat_init(void)
 
         q = vn / exp(-0.5 * dn * dn);
         ziggurat_kn[0] = (unsigned long)((dn / q) * m1);
-        ziggurat_kn[1] = 0;
+        ziggurat_kn[1] = 0;    /* Canonical zigset init: layer 1 always uses slow path */
 
         ziggurat_wn[0] = q / m1;
         ziggurat_wn[ZIGGURAT_N - 1] = dn / m1;
