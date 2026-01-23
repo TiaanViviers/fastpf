@@ -289,6 +289,232 @@ The library supports runtime control of OpenMP thread count. See [OPENMP_THREAD_
 - `num_threads > 0`: Explicit thread count
 - `num_threads = -1`: Force serial execution
 
+## State Management & Checkpointing
+
+The library provides a complete checkpoint system for saving and restoring particle filter state. This is essential for production environments where processes may crash, restart, or transition between training/backtesting and live deployment.
+
+### Overview
+
+**Checkpointing enables:**
+- **Crash Recovery**: Resume filtering after unexpected termination
+- **Model Deployment**: Transfer trained filter state from backtesting to production
+- **State Persistence**: Save filter state between runs (e.g., daily batch jobs)
+
+**Determinism Guarantee**: Restoring from a checkpoint and continuing with the same observation sequence produces **bitwise-identical** results to a run that never checkpointed.
+
+### API Functions
+
+```c
+/* Calculate required buffer size */
+size_t fastpf_checkpoint_bytes(const fastpf_t* pf);
+
+/* Save filter state to binary blob */
+int fastpf_checkpoint_write(const fastpf_t* pf, void* dst, size_t dst_bytes);
+
+/* Restore filter state from binary blob */
+int fastpf_checkpoint_read(fastpf_t* pf, const fastpf_cfg_t* cfg,
+                           const void* src, size_t src_bytes);
+```
+
+### What Is Saved
+
+The checkpoint blob contains **only** the particle filter state needed for deterministic continuation:
+
+**Saved (Core State):**
+- Configuration: `n_particles`, `state_size`, `resample_threshold`, `resample_method`
+- RNG state: Complete PCG32 state (16 bytes) for deterministic continuation
+- Particles: All N particle states (`particles_curr` buffer)
+- Weights: All N log-weights (unnormalized)
+
+**Not Saved (Recomputed/Scratch):**
+- Scratch buffers: `particles_next`, `norm_weights`, `resample_indices`
+- Diagnostics: `ess`, `max_weight`, `log_norm_const` (recomputed on next step)
+- Thread configuration: `num_threads` (runtime policy, not state)
+- Original seed: `rng_seed` (irrelevant after init, RNG state is truth)
+
+**Not Saved (Your Responsibility):**
+- **Model callbacks**: Function pointers (must be reconstructed before restore)
+- **Model parameters**: `model.ctx` data
+
+### Usage Patterns
+
+#### Pattern 1: Save and Restore (Typical Workflow)
+
+```c
+/* During live operation - save checkpoint */
+{
+    size_t ckpt_size = fastpf_checkpoint_bytes(&pf);
+    void* ckpt_blob = malloc(ckpt_size);
+    
+    int result = fastpf_checkpoint_write(&pf, ckpt_blob, ckpt_size);
+    assert(result == FASTPF_SUCCESS);
+    
+    /* Write to disk/database */
+    FILE* f = fopen("pf_state.ckpt", "wb");
+    fwrite(ckpt_blob, 1, ckpt_size, f);
+    fclose(f);
+    
+    free(ckpt_blob);
+}
+
+/* After restart - restore checkpoint */
+{
+    /* Step 1: Reconstruct model (CRITICAL!) */
+    my_model_ctx_t model_params;
+    load_model_params(&model_params, "model.params");  /* Your function */
+    
+    fastpf_model_t model;
+    model.ctx = &model_params;
+    model.prior_sample = my_prior_sample;
+    model.transition_sample = my_transition_sample;
+    model.log_likelihood = my_log_likelihood;
+    model.rejuvenate = NULL;
+    
+    /* Step 2: Load checkpoint blob */
+    FILE* f = fopen("pf_state.ckpt", "rb");
+    fseek(f, 0, SEEK_END);
+    size_t ckpt_size = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    
+    void* ckpt_blob = malloc(ckpt_size);
+    fread(ckpt_blob, 1, ckpt_size, f);
+    fclose(f);
+    
+    /* Step 3: Restore PF state */
+    fastpf_t pf;
+    fastpf_cfg_t cfg;
+    
+    memset(&pf, 0, sizeof(pf));
+    pf.model = model;  /* Set callbacks BEFORE restore */
+    
+    fastpf_cfg_init(&cfg, 1000, sizeof(double));  /* N, state_size */
+    cfg.num_threads = 4;  /* Can differ from original */
+    
+    int result = fastpf_checkpoint_read(&pf, &cfg, ckpt_blob, ckpt_size);
+    assert(result == FASTPF_SUCCESS);
+    
+    free(ckpt_blob);
+    
+    /* Step 4: Continue filtering */
+    fastpf_step(&pf, &next_observation);
+    
+    /* Cleanup */
+    fastpf_free(&pf);
+}
+```
+
+#### Pattern 2: Overwrite Existing PF
+
+```c
+/* Restore into already-initialized PF (overwrites state) */
+fastpf_t pf;
+fastpf_cfg_t cfg;
+fastpf_model_t model;
+
+/* Initialize PF normally */
+fastpf_cfg_init(&cfg, 1000, sizeof(double));
+/* ... set up model ... */
+fastpf_init(&pf, &cfg, &model);
+
+/* Load checkpoint (validates config matches, then overwrites state) */
+/* Note: cfg can be NULL in Pattern 2 since pf is already initialized */
+int result = fastpf_checkpoint_read(&pf, NULL, ckpt_blob, ckpt_size);
+assert(result == FASTPF_SUCCESS);
+
+/* PF now contains checkpoint state, ready to continue */
+fastpf_step(&pf, &observation);
+```
+
+### Critical Preconditions
+
+**FOOTGUN #1: Model callbacks MUST be set before `fastpf_checkpoint_read()`**
+
+The checkpoint does **not** contain model callbacks or `model.ctx` data. You **must**:
+1. Separately save/load your model parameters
+2. Reconstruct the `fastpf_model_t` structure with valid function pointers
+3. Set `pf.model` **before** calling `fastpf_checkpoint_read()`
+
+Failure to do this returns `FASTPF_ERR_INVALID_ARG`.
+
+**FOOTGUN #2: Checkpoint size depends on N and state_size**
+
+You **cannot** load a checkpoint saved with N=1000 into a PF with N=10000. The code validates this and returns `FASTPF_ERR_CHECKPOINT_SIZE` on mismatch.
+
+**Solution**: Use the same `n_particles` and `state_size` in training and production.
+
+**FOOTGUN #3: Cross-platform checkpoints not supported (v1)**
+
+Checkpoints are **not portable** across:
+- Different endianness (x86 vs some ARM variants)
+- Different `sizeof(double)` (rare, but possible on exotic platforms)
+
+The code detects mismatches and returns `FASTPF_ERR_CHECKPOINT_PORTABILITY`. This is **intentional** for v1 simplicity - no byte-swapping overhead.
+
+### Blob Format (Version 1)
+
+The checkpoint blob has the following structure:
+
+**Header (80 bytes):**
+```
+Offset | Size | Field              | Purpose
+-------|------|--------------------|---------------------------------
+0      | 8    | magic              | "FASTPFCK" (corruption detection)
+8      | 4    | version            | Format version (currently 1)
+12     | 4    | endianness_tag     | 0x01020304 (byte order check)
+16     | 4    | sizeof_double      | Platform verification
+20     | 4    | flags              | Optional payload indicators
+24     | 8    | n_particles        | Number of particles N
+32     | 8    | state_size         | Particle state size
+40     | 4    | resample_method    | Resampling algorithm
+48     | 8    | resample_threshold | ESS/N threshold
+56     | 8    | rng_state          | PCG32 state
+64     | 8    | rng_inc            | PCG32 stream selector
+72     | 8    | reserved           | Future use
+```
+
+**Payload (variable size):**
+```
+80                : particles_curr[N * state_size]
+80 + N*state_size : log_weights[N]
+```
+
+**Total size**: `80 + N * state_size + N * sizeof(double)` bytes
+
+### Error Codes
+
+```c
+FASTPF_SUCCESS                      /* 0:  Checkpoint saved/loaded */
+FASTPF_ERR_INVALID_ARG              /* -1: NULL pointer or model not set */
+FASTPF_ERR_ALLOC                    /* -2: Memory allocation failed */
+FASTPF_ERR_CHECKPOINT_MAGIC         /* -10: Magic bytes mismatch */
+FASTPF_ERR_CHECKPOINT_VERSION       /* -11: Unsupported version */
+FASTPF_ERR_CHECKPOINT_PORTABILITY   /* -12: Endianness/sizeof mismatch */
+FASTPF_ERR_CHECKPOINT_SIZE          /* -13: Size mismatch or truncated */
+FASTPF_ERR_CHECKPOINT_CORRUPT       /* -14: NaNs or invalid data */
+```
+
+### Testing & Validation
+
+The checkpoint system includes comprehensive tests (see `tests/unit/test_checkpoint.c`):
+
+1. **Deterministic resume**: Hash-based verification that checkpoint→resume produces bitwise-identical results
+2. **Resampling alignment**: Both paths resample on the same steps after restore
+3. **Pattern 1 & 2**: Both usage patterns tested
+4. **Failure modes**: All validation checks tested (magic, version, size, endianness, model callbacks)
+
+Run checkpoint tests:
+```bash
+make test  # Includes bin/test_checkpoint
+```
+
+### Future Extensions (v2+)
+
+The checkpoint format is designed for extensibility:
+- `version` field allows rejecting unknown formats
+- `flags` field (bits 0-1 used) supports optional extensions
+- `reserved` bytes (8 bytes) for future metadata
+- Could add: compression, CRC checksums, byte-swapping for portability
+
 ## Algorithm Details
 
 ### Sequential Importance Resampling (SIR)

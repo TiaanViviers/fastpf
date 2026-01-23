@@ -18,6 +18,7 @@
     /* Fallback: assumes compiler supports 64-bit unsigned long long.
      * This is a C99 feature but widely supported as an extension in C90 compilers.
      * If your compiler lacks this, you'll need to provide uint64_t another way. */
+    typedef unsigned int       uint32_t;
     typedef unsigned long long uint64_t;
 #endif
 
@@ -34,6 +35,13 @@ extern "C" {
 #define FASTPF_ERR_ALLOC        -2
 #define FASTPF_ERR_NUMERICAL    -3
 #define FASTPF_ERR_NOT_INIT     -4
+
+/* Checkpointing error codes */
+#define FASTPF_ERR_CHECKPOINT_MAGIC        -10  /* Magic bytes mismatch */
+#define FASTPF_ERR_CHECKPOINT_VERSION      -11  /* Unsupported version */
+#define FASTPF_ERR_CHECKPOINT_PORTABILITY  -12  /* Endianness/sizeof mismatch */
+#define FASTPF_ERR_CHECKPOINT_SIZE         -13  /* Size mismatch or truncated */
+#define FASTPF_ERR_CHECKPOINT_CORRUPT      -14  /* NaNs or invalid data */
 
 /* ========================================================================
  * Forward declarations
@@ -249,6 +257,127 @@ size_t fastpf_num_particles(const fastpf_t* pf);
  * @return Size of each particle state in bytes.
  */
 size_t fastpf_state_size(const fastpf_t* pf);
+
+/* ========================================================================
+ * State Management & Checkpointing
+ * ======================================================================== */
+
+/**
+ * @brief Calculate the size (in bytes) required for a checkpoint blob.
+ *
+ * Returns the total number of bytes needed to serialize the complete
+ * particle filter state, including:
+ * - Header with metadata (magic, version, cfg, RNG state)
+ * - All N particles (N * state_size bytes)
+ * - All N log-weights (N * sizeof(double) bytes)
+ *
+ * Use this to allocate a buffer before calling fastpf_checkpoint_write().
+ *
+ * @param pf Pointer to initialized PF instance.
+ * @return Number of bytes required, or 0 if pf is invalid/uninitialized.
+ */
+size_t fastpf_checkpoint_bytes(const fastpf_t* pf);
+
+/**
+ * @brief Serialize particle filter state to a binary blob.
+ *
+ * Writes a portable-enough binary checkpoint that captures the complete
+ * PF state needed for deterministic resume. The blob includes:
+ * - Configuration (N, state_size, resample config)
+ * - RNG state (for deterministic continuation)
+ * - Current particles (particles_curr buffer)
+ * - Current log-weights
+ *
+ * The blob does NOT include:
+ * - Scratch buffers (particles_next, norm_weights, resample_indices)
+ * - Diagnostics (recomputed on next step)
+ * - Model callbacks or model.ctx data
+ * - Thread configuration (runtime decision, not state)
+ *
+ * Portability guarantees:
+ * - Same architecture (endianness checked on load)
+ * - Same compiler/platform (sizeof(double) checked on load)
+ * - Version 1 format: no byte-swapping, raw binary dump
+ * - Fails loudly on mismatch rather than silently corrupting
+ *
+ * CRITICAL: The blob is a snapshot of PF state only.
+ *
+ * @param pf Pointer to initialized PF instance.
+ * @param dst Destination buffer (must be at least fastpf_checkpoint_bytes(pf) bytes).
+ * @param dst_bytes Size of destination buffer (for bounds checking).
+ * @return FASTPF_SUCCESS or error code:
+ *         - FASTPF_ERR_INVALID_ARG if pf is NULL or uninitialized
+ *         - FASTPF_ERR_CHECKPOINT_SIZE if dst_bytes is too small
+ */
+int fastpf_checkpoint_write(const fastpf_t* pf, void* dst, size_t dst_bytes);
+
+/**
+ * @brief Restore particle filter state from a binary checkpoint blob.
+ *
+ * Loads a previously saved checkpoint into a PF instance. Two usage patterns:
+ *
+ * Pattern 1: Load into uninitialized PF (allocates + restores)
+ * -----------------------------------------------------------
+ *   fastpf_t pf;
+ *   memset(&pf, 0, sizeof(pf));
+ *   pf.model = ...; // Set callbacks first!
+ *   fastpf_checkpoint_read(&pf, &cfg, blob, blob_size);
+ *   // pf is now initialized and ready for fastpf_step()
+ *
+ * Pattern 2: Load into already-initialized PF (validates + overwrites)
+ * ---------------------------------------------------------------------
+ *   fastpf_t pf;
+ *   fastpf_init(&pf, &cfg, &model);
+ *   fastpf_checkpoint_read(&pf, NULL, blob, blob_size);
+ *   // pf state overwritten, ready to continue from checkpoint
+ *
+ * CRITICAL PRECONDITIONS:
+ * 1. Model callbacks MUST be set before calling this function.
+ *    The checkpoint does NOT contain callbacks.
+ *
+ * 2. The blob must match the PF configuration:
+ *    - Same n_particles
+ *    - Same state_size
+ *    - Same endianness and sizeof(double)
+ *
+ * Validation performed:
+ * - Magic bytes ("FASTPFCK")
+ * - Version (currently only v1 supported)
+ * - Endianness tag (0x01020304 in native byte order)
+ * - sizeof(double) matches current platform
+ * - n_particles and state_size match (if pf already initialized)
+ * - Buffer size sufficient
+ * - No NaNs in log_weights
+ * - Model callbacks are non-NULL
+ *
+ * After successful restore:
+ * - pf->initialized = 1
+ * - Particles and log-weights restored
+ * - RNG state restored (deterministic continuation)
+ * - Diagnostics reset to invalid/zero (recomputed on next step)
+ * - Scratch buffers left uninitialized (filled on next step)
+ *
+ * DETERMINISM GUARANTEE: If you restore from a checkpoint and continue
+ * with the same observation sequence, the trajectory will be bitwise
+ * identical to a run that never checkpointed.
+ *
+ * @param pf Pointer to PF instance (may be uninitialized or already init).
+ * @param cfg Configuration (required if pf->initialized==0, may be NULL otherwise).
+ * @param src Source buffer containing checkpoint blob.
+ * @param src_bytes Size of source buffer.
+ * @return FASTPF_SUCCESS or error code:
+ *         - FASTPF_ERR_INVALID_ARG if pf is NULL, model callbacks not set, or cfg required but NULL
+ *         - FASTPF_ERR_CHECKPOINT_MAGIC if magic bytes don't match
+ *         - FASTPF_ERR_CHECKPOINT_VERSION if version unsupported
+ *         - FASTPF_ERR_CHECKPOINT_PORTABILITY if endianness/sizeof mismatch
+ *         - FASTPF_ERR_CHECKPOINT_SIZE if size mismatch or truncated
+ *         - FASTPF_ERR_CHECKPOINT_CORRUPT if NaNs or invalid data detected
+ *         - FASTPF_ERR_ALLOC if memory allocation fails (Pattern 1 only)
+ */
+int fastpf_checkpoint_read(fastpf_t* pf,
+                           const fastpf_cfg_t* cfg,
+                           const void* src,
+                           size_t src_bytes);
 
 #ifdef __cplusplus
 }

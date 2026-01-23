@@ -66,7 +66,8 @@ LIB_SOURCES = $(SRC_DIR)/fastpf.c \
               $(SRC_DIR)/resample.c \
               $(SRC_DIR)/rng.c \
               $(SRC_DIR)/stats.c \
-              $(SRC_DIR)/util.c
+              $(SRC_DIR)/util.c \
+              $(SRC_DIR)/checkpoint.c
 
 LIB_OBJECTS = $(patsubst $(SRC_DIR)/%.c,$(BUILD_DIR)/%.o,$(LIB_SOURCES))
 
